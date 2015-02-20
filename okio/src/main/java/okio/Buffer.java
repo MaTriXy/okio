@@ -86,18 +86,27 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
     return this; // Nowhere to emit to!
   }
 
+  @Override public BufferedSink emit() throws IOException {
+    return this; // Nowhere to emit to!
+  }
+
   @Override public boolean exhausted() {
     return size == 0;
   }
 
   @Override public void require(long byteCount) throws EOFException {
-    if (this.size < byteCount) throw new EOFException();
+    if (size < byteCount) throw new EOFException();
+  }
+
+  @Override public boolean request(long byteCount) throws IOException {
+    return size >= byteCount;
   }
 
   @Override public InputStream inputStream() {
     return new InputStream() {
       @Override public int read() {
-        return readByte() & 0xff;
+        if (size > 0) return readByte() & 0xff;
+        return -1;
       }
 
       @Override public int read(byte[] sink, int offset, int byteCount) {
@@ -115,6 +124,131 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
         return Buffer.this + ".inputStream()";
       }
     };
+  }
+
+  /** Copy the contents of this to {@code out}. */
+  public Buffer copyTo(OutputStream out) throws IOException {
+    return copyTo(out, 0, size);
+  }
+
+  /**
+   * Copy {@code byteCount} bytes from this, starting at {@code offset}, to
+   * {@code out}.
+   */
+  public Buffer copyTo(OutputStream out, long offset, long byteCount) throws IOException {
+    if (out == null) throw new IllegalArgumentException("out == null");
+    checkOffsetAndCount(size, offset, byteCount);
+    if (byteCount == 0) return this;
+
+    // Skip segments that we aren't copying from.
+    Segment s = head;
+    for (; offset >= (s.limit - s.pos); s = s.next) {
+      offset -= (s.limit - s.pos);
+    }
+
+    // Copy from one segment at a time.
+    for (; byteCount > 0; s = s.next) {
+      int pos = (int) (s.pos + offset);
+      int toCopy = (int) Math.min(s.limit - pos, byteCount);
+      out.write(s.data, pos, toCopy);
+      byteCount -= toCopy;
+      offset = 0;
+    }
+
+    return this;
+  }
+
+  /** Copy {@code byteCount} bytes from this, starting at {@code offset}, to {@code out}. */
+  public Buffer copyTo(Buffer out, long offset, long byteCount) {
+    if (out == null) throw new IllegalArgumentException("out == null");
+    checkOffsetAndCount(size, offset, byteCount);
+    if (byteCount == 0) return this;
+
+    Segment source = head;
+    Segment target = out.writableSegment(1);
+    out.size += byteCount;
+
+    while (byteCount > 0) {
+      // If necessary, advance to a readable source segment. This won't repeat after the first copy.
+      while (offset >= source.limit - source.pos) {
+        offset -= (source.limit - source.pos);
+        source = source.next;
+      }
+
+      // If necessary, append another target segment.
+      if (target.limit == Segment.SIZE) {
+        target = target.push(SegmentPool.INSTANCE.take());
+      }
+
+      // Copy bytes from the source segment to the target segment.
+      long sourceReadable = Math.min(source.limit - (source.pos + offset), byteCount);
+      long targetWritable = Segment.SIZE - target.limit;
+      int toCopy = (int) Math.min(sourceReadable, targetWritable);
+      System.arraycopy(source.data, source.pos + (int) offset, target.data, target.limit, toCopy);
+      offset += toCopy;
+      target.limit += toCopy;
+      byteCount -= toCopy;
+    }
+
+    return this;
+  }
+
+  /** Write the contents of this to {@code out}. */
+  public Buffer writeTo(OutputStream out) throws IOException {
+    return writeTo(out, size);
+  }
+
+  /** Write {@code byteCount} bytes from this to {@code out}. */
+  public Buffer writeTo(OutputStream out, long byteCount) throws IOException {
+    if (out == null) throw new IllegalArgumentException("out == null");
+    checkOffsetAndCount(size, 0, byteCount);
+
+    Segment s = head;
+    while (byteCount > 0) {
+      int toCopy = (int) Math.min(byteCount, s.limit - s.pos);
+      out.write(s.data, s.pos, toCopy);
+
+      s.pos += toCopy;
+      size -= toCopy;
+      byteCount -= toCopy;
+
+      if (s.pos == s.limit) {
+        Segment toRecycle = s;
+        head = s = toRecycle.pop();
+        SegmentPool.INSTANCE.recycle(toRecycle);
+      }
+    }
+
+    return this;
+  }
+
+  /** Read and exhaust bytes from {@code in} to this. */
+  public Buffer readFrom(InputStream in) throws IOException {
+    readFrom(in, Long.MAX_VALUE, true);
+    return this;
+  }
+
+  /** Read {@code byteCount} bytes from {@code in} to this. */
+  public Buffer readFrom(InputStream in, long byteCount) throws IOException {
+    if (byteCount < 0) throw new IllegalArgumentException("byteCount < 0: " + byteCount);
+    readFrom(in, byteCount, false);
+    return this;
+  }
+
+  private void readFrom(InputStream in, long byteCount, boolean forever) throws IOException {
+    if (in == null) throw new IllegalArgumentException("in == null");
+    while (byteCount > 0 || forever) {
+      Segment tail = writableSegment(1);
+      int maxToCopy = (int) Math.min(byteCount, Segment.SIZE - tail.limit);
+      int bytesRead = in.read(tail.data, tail.limit, maxToCopy);
+      if (bytesRead == -1) {
+        if (forever) return;
+        throw new EOFException();
+      }
+      tail.limit += bytesRead;
+      size += bytesRead;
+      byteCount -= bytesRead;
+    }
   }
 
   /**
@@ -273,44 +407,77 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
     return Util.reverseBytesLong(readLong());
   }
 
-  @Override public ByteString readByteString(long byteCount) {
-    return new ByteString(readBytes(byteCount));
+  @Override public ByteString readByteString() {
+    return new ByteString(readByteArray());
   }
 
-  @Override public void readFully(Buffer sink, long byteCount) throws IOException {
+  @Override public ByteString readByteString(long byteCount) throws EOFException {
+    return new ByteString(readByteArray(byteCount));
+  }
+
+  @Override public void readFully(Buffer sink, long byteCount) throws EOFException {
+    if (size < byteCount) {
+      sink.write(this, size); // Exhaust ourselves.
+      throw new EOFException();
+    }
     sink.write(this, byteCount);
   }
 
-  @Override public String readUtf8(long byteCount) {
+  @Override public long readAll(Sink sink) throws IOException {
+    long byteCount = size;
+    if (byteCount > 0) {
+      sink.write(this, byteCount);
+    }
+    return byteCount;
+  }
+
+  @Override public String readUtf8() {
+    try {
+      return readString(size, Util.UTF_8);
+    } catch (EOFException e) {
+      throw new AssertionError(e);
+    }
+  }
+
+  @Override public String readUtf8(long byteCount) throws EOFException {
     return readString(byteCount, Util.UTF_8);
   }
 
-  @Override public String readString(long byteCount, Charset charset) {
-    checkOffsetAndCount(this.size, 0, byteCount);
+  @Override public String readString(Charset charset) {
+    try {
+      return readString(size, charset);
+    } catch (EOFException e) {
+      throw new AssertionError(e);
+    }
+  }
+
+  @Override public String readString(long byteCount, Charset charset) throws EOFException {
+    checkOffsetAndCount(size, 0, byteCount);
+    if (charset == null) throw new IllegalArgumentException("charset == null");
     if (byteCount > Integer.MAX_VALUE) {
       throw new IllegalArgumentException("byteCount > Integer.MAX_VALUE: " + byteCount);
     }
     if (byteCount == 0) return "";
 
-    Segment head = this.head;
-    if (head.pos + byteCount > head.limit) {
+    Segment s = head;
+    if (s.pos + byteCount > s.limit) {
       // If the string spans multiple segments, delegate to readBytes().
-      return new String(readBytes(byteCount), charset);
+      return new String(readByteArray(byteCount), charset);
     }
 
-    String result = new String(head.data, head.pos, (int) byteCount, charset);
-    head.pos += byteCount;
-    this.size -= byteCount;
+    String result = new String(s.data, s.pos, (int) byteCount, charset);
+    s.pos += byteCount;
+    size -= byteCount;
 
-    if (head.pos == head.limit) {
-      this.head = head.pop();
-      SegmentPool.INSTANCE.recycle(head);
+    if (s.pos == s.limit) {
+      head = s.pop();
+      SegmentPool.INSTANCE.recycle(s);
     }
 
     return result;
   }
 
-  @Override public String readUtf8Line() throws IOException {
+  @Override public String readUtf8Line() throws EOFException {
     long newline = indexOf((byte) '\n');
 
     if (newline == -1) {
@@ -320,13 +487,18 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
     return readUtf8Line(newline);
   }
 
-  @Override public String readUtf8LineStrict() throws IOException {
+  @Override public String readUtf8LineStrict() throws EOFException {
     long newline = indexOf((byte) '\n');
-    if (newline == -1) throw new EOFException();
+    if (newline == -1) {
+      Buffer data = new Buffer();
+      copyTo(data, 0, Math.min(32, size));
+      throw new EOFException("\\n not found: size=" + size()
+          + " content=" + data.readByteString().hex() + "...");
+    }
     return readUtf8Line(newline);
   }
 
-  String readUtf8Line(long newline) {
+  String readUtf8Line(long newline) throws EOFException {
     if (newline > 0 && getByte(newline - 1) == '\r') {
       // Read everything until '\r\n', then skip the '\r\n'.
       String result = readUtf8((newline - 1));
@@ -341,45 +513,51 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
     }
   }
 
-  private byte[] readBytes(long byteCount) {
-    checkOffsetAndCount(this.size, 0, byteCount);
+  @Override public byte[] readByteArray() {
+    try {
+      return readByteArray(size);
+    } catch (EOFException e) {
+      throw new AssertionError(e);
+    }
+  }
+
+  @Override public byte[] readByteArray(long byteCount) throws EOFException {
+    checkOffsetAndCount(size, 0, byteCount);
     if (byteCount > Integer.MAX_VALUE) {
       throw new IllegalArgumentException("byteCount > Integer.MAX_VALUE: " + byteCount);
     }
 
-    int offset = 0;
     byte[] result = new byte[(int) byteCount];
-
-    while (offset < byteCount) {
-      int toCopy = (int) Math.min(byteCount - offset, head.limit - head.pos);
-      System.arraycopy(head.data, head.pos, result, offset, toCopy);
-
-      offset += toCopy;
-      head.pos += toCopy;
-
-      if (head.pos == head.limit) {
-        Segment toRecycle = head;
-        head = toRecycle.pop();
-        SegmentPool.INSTANCE.recycle(toRecycle);
-      }
-    }
-
-    this.size -= byteCount;
+    readFully(result);
     return result;
   }
 
-  /** Like {@link InputStream#read}. */
-  int read(byte[] sink, int offset, int byteCount) {
-    Segment s = this.head;
+  @Override public int read(byte[] sink) {
+    return read(sink, 0, sink.length);
+  }
+
+  @Override public void readFully(byte[] sink) throws EOFException {
+    int offset = 0;
+    while (offset < sink.length) {
+      int read = read(sink, offset, sink.length - offset);
+      if (read == -1) throw new EOFException();
+      offset += read;
+    }
+  }
+
+  @Override public int read(byte[] sink, int offset, int byteCount) {
+    checkOffsetAndCount(sink.length, offset, byteCount);
+
+    Segment s = head;
     if (s == null) return -1;
     int toCopy = Math.min(byteCount, s.limit - s.pos);
     System.arraycopy(s.data, s.pos, sink, offset, toCopy);
 
     s.pos += toCopy;
-    this.size -= toCopy;
+    size -= toCopy;
 
     if (s.pos == s.limit) {
-      this.head = s.pop();
+      head = s.pop();
       SegmentPool.INSTANCE.recycle(s);
     }
 
@@ -391,16 +569,20 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
    * with a buffer will return its segments to the pool.
    */
   public void clear() {
-    skip(size);
+    try {
+      skip(size);
+    } catch (EOFException e) {
+      throw new AssertionError(e);
+    }
   }
 
   /** Discards {@code byteCount} bytes from the head of this buffer. */
-  @Override public void skip(long byteCount) {
-    checkOffsetAndCount(this.size, 0, byteCount);
-
-    this.size -= byteCount;
+  @Override public void skip(long byteCount) throws EOFException {
     while (byteCount > 0) {
+      if (head == null) throw new EOFException();
+
       int toSkip = (int) Math.min(byteCount, head.limit - head.pos);
+      size -= toSkip;
       byteCount -= toSkip;
       head.pos += toSkip;
 
@@ -413,24 +595,95 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
   }
 
   @Override public Buffer write(ByteString byteString) {
+    if (byteString == null) throw new IllegalArgumentException("byteString == null");
     return write(byteString.data, 0, byteString.data.length);
   }
 
   @Override public Buffer writeUtf8(String string) {
-    // TODO: inline UTF-8 encoding to save allocating a byte[]?
-    return writeString(string, Util.UTF_8);
+    if (string == null) throw new IllegalArgumentException("string == null");
+
+    // Transcode a UTF-16 Java String to UTF-8 bytes.
+    for (int i = 0, length = string.length(); i < length;) {
+      int c = string.charAt(i);
+
+      if (c < 0x80) {
+        Segment tail = writableSegment(1);
+        byte[] data = tail.data;
+        int segmentOffset = tail.limit - i;
+        int runLimit = Math.min(length, Segment.SIZE - segmentOffset);
+
+        // Emit a 7-bit character with 1 byte.
+        data[segmentOffset + i++] = (byte) c; // 0xxxxxxx
+
+        // Fast-path contiguous runs of ASCII characters. This is ugly, but yields a ~4x performance
+        // improvement over independent calls to writeByte().
+        while (i < runLimit) {
+          c = string.charAt(i);
+          if (c >= 0x80) break;
+          data[segmentOffset + i++] = (byte) c; // 0xxxxxxx
+        }
+
+        int runSize = i + segmentOffset - tail.limit; // Equivalent to i - (previous i).
+        tail.limit += runSize;
+        size += runSize;
+
+      } else if (c < 0x800) {
+        // Emit a 11-bit character with 2 bytes.
+        writeByte(c >>  6        | 0xc0); // 110xxxxx
+        writeByte(c       & 0x3f | 0x80); // 10xxxxxx
+        i++;
+
+      } else if (c < 0xd800 || c > 0xdfff) {
+        // Emit a 16-bit character with 3 bytes.
+        writeByte(c >> 12        | 0xe0); // 1110xxxx
+        writeByte(c >>  6 & 0x3f | 0x80); // 10xxxxxx
+        writeByte(c       & 0x3f | 0x80); // 10xxxxxx
+        i++;
+
+      } else {
+        // c is a surrogate. Make sure it is a high surrogate & that its successor is a low
+        // surrogate. If not, the UTF-16 is invalid, in which case we emit a replacement character.
+        int low = i + 1 < length ? string.charAt(i + 1) : 0;
+        if (c > 0xdbff || low < 0xdc00 || low > 0xdfff) {
+          writeByte('?');
+          i++;
+          continue;
+        }
+
+        // UTF-16 high surrogate: 110110xxxxxxxxxx (10 bits)
+        // UTF-16 low surrogate:  110111yyyyyyyyyy (10 bits)
+        // Unicode code point:    00010000000000000000 + xxxxxxxxxxyyyyyyyyyy (21 bits)
+        int codePoint = 0x010000 + ((c & ~0xd800) << 10 | low & ~0xdc00);
+
+        // Emit a 21-bit character with 4 bytes.
+        writeByte(codePoint >> 18        | 0xf0); // 11110xxx
+        writeByte(codePoint >> 12 & 0x3f | 0x80); // 10xxxxxx
+        writeByte(codePoint >>  6 & 0x3f | 0x80); // 10xxyyyy
+        writeByte(codePoint       & 0x3f | 0x80); // 10yyyyyy
+        i += 2;
+      }
+    }
+
+    return this;
   }
 
   @Override public Buffer writeString(String string, Charset charset) {
+    if (string == null) throw new IllegalArgumentException("string == null");
+    if (charset == null) throw new IllegalArgumentException("charset == null");
+    if (charset.equals(Util.UTF_8)) return writeUtf8(string);
     byte[] data = string.getBytes(charset);
     return write(data, 0, data.length);
   }
 
   @Override public Buffer write(byte[] source) {
+    if (source == null) throw new IllegalArgumentException("source == null");
     return write(source, 0, source.length);
   }
 
   @Override public Buffer write(byte[] source, int offset, int byteCount) {
+    if (source == null) throw new IllegalArgumentException("source == null");
+    checkOffsetAndCount(source.length, offset, byteCount);
+
     int limit = offset + byteCount;
     while (offset < limit) {
       Segment tail = writableSegment(1);
@@ -442,7 +695,23 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
       tail.limit += toCopy;
     }
 
-    this.size += byteCount;
+    size += byteCount;
+    return this;
+  }
+
+  @Override public long writeAll(Source source) throws IOException {
+    if (source == null) throw new IllegalArgumentException("source == null");
+    long totalBytesRead = 0;
+    for (long readCount; (readCount = source.read(this, Segment.SIZE)) != -1; ) {
+      totalBytesRead += readCount;
+    }
+    return totalBytesRead;
+  }
+
+  @Override public BufferedSink write(Source source, long byteCount) throws IOException {
+    if (byteCount > 0) {
+      source.read(this, byteCount);
+    }
     return this;
   }
 
@@ -576,9 +845,8 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
     // an equivalent buffer [30%, 62%, 82%] and then move the head segment,
     // yielding sink [51%, 91%, 30%] and source [62%, 82%].
 
-    if (source == this) {
-      throw new IllegalArgumentException("source == this");
-    }
+    if (source == null) throw new IllegalArgumentException("source == null");
+    if (source == this) throw new IllegalArgumentException("source == this");
     checkOffsetAndCount(source.size, 0, byteCount);
 
     while (byteCount > 0) {
@@ -593,7 +861,7 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
           // Our existing segments are sufficient. Move bytes from source's head to our tail.
           source.head.writeTo(tail, (int) byteCount);
           source.size -= byteCount;
-          this.size += byteCount;
+          size += byteCount;
           return;
         }
       }
@@ -611,14 +879,16 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
         tail.compact();
       }
       source.size -= movedByteCount;
-      this.size += movedByteCount;
+      size += movedByteCount;
       byteCount -= movedByteCount;
     }
   }
 
   @Override public long read(Buffer sink, long byteCount) {
-    if (this.size == 0) return -1L;
-    if (byteCount > this.size) byteCount = this.size;
+    if (sink == null) throw new IllegalArgumentException("sink == null");
+    if (byteCount < 0) throw new IllegalArgumentException("byteCount < 0: " + byteCount);
+    if (size == 0) return -1L;
+    if (byteCount > size) byteCount = size;
     sink.write(this, byteCount);
     return byteCount;
   }
@@ -631,7 +901,9 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
    * Returns the index of {@code b} in this at or beyond {@code fromIndex}, or
    * -1 if this buffer does not contain {@code b} in that range.
    */
-  public long indexOf(byte b, long fromIndex) {
+  @Override public long indexOf(byte b, long fromIndex) {
+    if (fromIndex < 0) throw new IllegalArgumentException("fromIndex < 0");
+
     Segment s = head;
     if (s == null) return -1L;
     long offset = 0L;
@@ -643,6 +915,37 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
         byte[] data = s.data;
         for (long pos = s.pos + fromIndex, limit = s.limit; pos < limit; pos++) {
           if (data[(int) pos] == b) return offset + pos - s.pos;
+        }
+        fromIndex = 0;
+      }
+      offset += segmentByteCount;
+      s = s.next;
+    } while (s != head);
+    return -1L;
+  }
+
+  @Override public long indexOfElement(ByteString targetBytes) {
+    return indexOfElement(targetBytes, 0);
+  }
+
+  @Override public long indexOfElement(ByteString targetBytes, long fromIndex) {
+    if (fromIndex < 0) throw new IllegalArgumentException("fromIndex < 0");
+
+    Segment s = head;
+    if (s == null) return -1L;
+    long offset = 0L;
+    byte[] toFind = targetBytes.data;
+    do {
+      int segmentByteCount = s.limit - s.pos;
+      if (fromIndex >= segmentByteCount) {
+        fromIndex -= segmentByteCount;
+      } else {
+        byte[] data = s.data;
+        for (long pos = s.pos + fromIndex, limit = s.limit; pos < limit; pos++) {
+          byte b = data[(int) pos];
+          for (byte targetByte : toFind) {
+            if (b == targetByte) return offset + pos - s.pos;
+          }
         }
         fromIndex = 0;
       }
@@ -665,7 +968,7 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
   /** For testing. This returns the sizes of the segments in this buffer. */
   List<Integer> segmentSizes() {
     if (head == null) return Collections.emptyList();
-    List<Integer> result = new ArrayList<Integer>();
+    List<Integer> result = new ArrayList<>();
     result.add(head.limit - head.pos);
     for (Segment s = head.next; s != head; s = s.next) {
       result.add(s.limit - s.pos);
@@ -674,6 +977,7 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
   }
 
   @Override public boolean equals(Object o) {
+    if (this == o) return true;
     if (!(o instanceof Buffer)) return false;
     Buffer that = (Buffer) o;
     if (size != that.size) return false;
@@ -724,7 +1028,7 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
     }
 
     if (size <= 16) {
-      ByteString data = clone().readByteString(size);
+      ByteString data = clone().readByteString();
       return String.format("Buffer[size=%s data=%s]", size, data.hex());
     }
 
@@ -744,7 +1048,7 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
   /** Returns a deep copy of this buffer. */
   @Override public Buffer clone() {
     Buffer result = new Buffer();
-    if (size() == 0) return result;
+    if (size == 0) return result;
 
     result.write(head.data, head.pos, head.limit - head.pos);
     for (Segment s = head.next; s != head; s = s.next) {

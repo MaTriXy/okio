@@ -42,6 +42,7 @@ final class RealBufferedSource implements BufferedSource {
   }
 
   @Override public long read(Buffer sink, long byteCount) throws IOException {
+    if (sink == null) throw new IllegalArgumentException("sink == null");
     if (byteCount < 0) throw new IllegalArgumentException("byteCount < 0: " + byteCount);
     if (closed) throw new IllegalStateException("closed");
 
@@ -60,10 +61,16 @@ final class RealBufferedSource implements BufferedSource {
   }
 
   @Override public void require(long byteCount) throws IOException {
+    if (!request(byteCount)) throw new EOFException();
+  }
+
+  @Override public boolean request(long byteCount) throws IOException {
+    if (byteCount < 0) throw new IllegalArgumentException("byteCount < 0: " + byteCount);
     if (closed) throw new IllegalStateException("closed");
     while (buffer.size < byteCount) {
-      if (source.read(buffer, Segment.SIZE) == -1) throw new EOFException();
+      if (source.read(buffer, Segment.SIZE) == -1) return false;
     }
+    return true;
   }
 
   @Override public byte readByte() throws IOException {
@@ -71,14 +78,90 @@ final class RealBufferedSource implements BufferedSource {
     return buffer.readByte();
   }
 
+  @Override public ByteString readByteString() throws IOException {
+    buffer.writeAll(source);
+    return buffer.readByteString();
+  }
+
   @Override public ByteString readByteString(long byteCount) throws IOException {
     require(byteCount);
     return buffer.readByteString(byteCount);
   }
 
-  @Override public void readFully(Buffer sink, long byteCount) throws IOException {
+  @Override public byte[] readByteArray() throws IOException {
+    buffer.writeAll(source);
+    return buffer.readByteArray();
+  }
+
+  @Override public byte[] readByteArray(long byteCount) throws IOException {
     require(byteCount);
+    return buffer.readByteArray(byteCount);
+  }
+
+  @Override public int read(byte[] sink) throws IOException {
+    return read(sink, 0, sink.length);
+  }
+
+  @Override public void readFully(byte[] sink) throws IOException {
+    try {
+      require(sink.length);
+    } catch (EOFException e) {
+      // The underlying source is exhausted. Copy the bytes we got before rethrowing.
+      int offset = 0;
+      while (buffer.size > 0) {
+        int read = buffer.read(sink, offset, (int) buffer.size - offset);
+        if (read == -1) throw new AssertionError();
+        offset += read;
+      }
+      throw e;
+    }
+    buffer.readFully(sink);
+  }
+
+  @Override public int read(byte[] sink, int offset, int byteCount) throws IOException {
+    checkOffsetAndCount(sink.length, offset, byteCount);
+
+    if (buffer.size == 0) {
+      long read = source.read(buffer, Segment.SIZE);
+      if (read == -1) return -1;
+    }
+
+    int toRead = (int) Math.min(byteCount, buffer.size);
+    return buffer.read(sink, offset, toRead);
+  }
+
+  @Override public void readFully(Buffer sink, long byteCount) throws IOException {
+    try {
+      require(byteCount);
+    } catch (EOFException e) {
+      // The underlying source is exhausted. Copy the bytes we got before rethrowing.
+      sink.writeAll(buffer);
+      throw e;
+    }
     buffer.readFully(sink, byteCount);
+  }
+
+  @Override public long readAll(Sink sink) throws IOException {
+    if (sink == null) throw new IllegalArgumentException("sink == null");
+
+    long totalBytesWritten = 0;
+    while (source.read(buffer, Segment.SIZE) != -1) {
+      long emitByteCount = buffer.completeSegmentByteCount();
+      if (emitByteCount > 0) {
+        totalBytesWritten += emitByteCount;
+        sink.write(buffer, emitByteCount);
+      }
+    }
+    if (buffer.size() > 0) {
+      totalBytesWritten += buffer.size();
+      sink.write(buffer, buffer.size());
+    }
+    return totalBytesWritten;
+  }
+
+  @Override public String readUtf8() throws IOException {
+    buffer.writeAll(source);
+    return buffer.readUtf8();
   }
 
   @Override public String readUtf8(long byteCount) throws IOException {
@@ -86,8 +169,16 @@ final class RealBufferedSource implements BufferedSource {
     return buffer.readUtf8(byteCount);
   }
 
+  @Override public String readString(Charset charset) throws IOException {
+    if (charset == null) throw new IllegalArgumentException("charset == null");
+
+    buffer.writeAll(source);
+    return buffer.readString(charset);
+  }
+
   @Override public String readString(long byteCount, Charset charset) throws IOException {
     require(byteCount);
+    if (charset == null) throw new IllegalArgumentException("charset == null");
     return buffer.readString(byteCount, charset);
   }
 
@@ -103,7 +194,12 @@ final class RealBufferedSource implements BufferedSource {
 
   @Override public String readUtf8LineStrict() throws IOException {
     long newline = indexOf((byte) '\n');
-    if (newline == -1L) throw new EOFException();
+    if (newline == -1L) {
+      Buffer data = new Buffer();
+      buffer.copyTo(data, 0, Math.min(32, buffer.size()));
+      throw new EOFException("\\n not found: size=" + buffer.size()
+          + " content=" + data.readByteString().hex() + "...");
+    }
     return buffer.readUtf8Line(newline);
   }
 
@@ -150,11 +246,34 @@ final class RealBufferedSource implements BufferedSource {
   }
 
   @Override public long indexOf(byte b) throws IOException {
+    return indexOf(b, 0);
+  }
+
+  @Override public long indexOf(byte b, long fromIndex) throws IOException {
     if (closed) throw new IllegalStateException("closed");
-    long start = 0;
+    while (fromIndex >= buffer.size) {
+      if (source.read(buffer, Segment.SIZE) == -1) return -1L;
+    }
     long index;
-    while ((index = buffer.indexOf(b, start)) == -1) {
-      start = buffer.size;
+    while ((index = buffer.indexOf(b, fromIndex)) == -1) {
+      fromIndex = buffer.size;
+      if (source.read(buffer, Segment.SIZE) == -1) return -1L;
+    }
+    return index;
+  }
+
+  @Override public long indexOfElement(ByteString targetBytes) throws IOException {
+    return indexOfElement(targetBytes, 0);
+  }
+
+  @Override public long indexOfElement(ByteString targetBytes, long fromIndex) throws IOException {
+    if (closed) throw new IllegalStateException("closed");
+    while (fromIndex >= buffer.size) {
+      if (source.read(buffer, Segment.SIZE) == -1) return -1L;
+    }
+    long index;
+    while ((index = buffer.indexOfElement(targetBytes, fromIndex)) == -1) {
+      fromIndex = buffer.size;
       if (source.read(buffer, Segment.SIZE) == -1) return -1L;
     }
     return index;

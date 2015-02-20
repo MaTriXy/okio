@@ -25,8 +25,12 @@ import static okio.Util.UTF_8;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
+/**
+ * Tests solely for the behavior of RealBufferedSource's implementation. For generic
+ * BufferedSource behavior use BufferedSourceTest.
+ */
 public final class RealBufferedSourceTest {
-  @Test public void inputStreamFromSource() throws Exception {
+  @Test public void inputStreamTracksSegments() throws Exception {
     Buffer source = new Buffer();
     source.writeUtf8("a");
     source.writeUtf8(repeat('b', Segment.SIZE));
@@ -62,14 +66,15 @@ public final class RealBufferedSourceTest {
     assertEquals(0, source.size());
   }
 
-  @Test public void inputStreamFromSourceBounds() throws IOException {
-    Buffer source = new Buffer();
-    source.writeUtf8(repeat('a', 100));
-    InputStream in = new RealBufferedSource(source).inputStream();
+  @Test public void inputStreamCloses() throws Exception {
+    RealBufferedSource source = new RealBufferedSource(new Buffer());
+    InputStream in = source.inputStream();
+    in.close();
     try {
-      in.read(new byte[100], 50, 51);
+      source.require(1);
       fail();
-    } catch (ArrayIndexOutOfBoundsException expected) {
+    } catch (IllegalStateException e) {
+      assertEquals("closed", e.getMessage());
     }
   }
 
@@ -119,18 +124,6 @@ public final class RealBufferedSourceTest {
     bufferedSource.require(2);
     assertEquals(Segment.SIZE, source.size());
     assertEquals(Segment.SIZE, bufferedSource.buffer().size());
-  }
-
-  @Test public void skipInsufficientData() throws Exception {
-    Buffer source = new Buffer();
-    source.writeUtf8("a");
-
-    BufferedSource bufferedSource = new RealBufferedSource(source);
-    try {
-      bufferedSource.skip(2);
-      fail();
-    } catch (EOFException expected) {
-    }
   }
 
   @Test public void skipReadsOneSegmentAtATime() throws Exception {
@@ -198,5 +191,28 @@ public final class RealBufferedSourceTest {
       fail();
     } catch (IOException expected) {
     }
+  }
+
+  /**
+   * We don't want readAll to buffer an unbounded amount of data. Instead it
+   * should buffer a segment, write it, and repeat.
+   */
+  @Test public void readAllReadsOneSegmentAtATime() throws IOException {
+    Buffer write1 = new Buffer().writeUtf8(TestUtil.repeat('a', Segment.SIZE));
+    Buffer write2 = new Buffer().writeUtf8(TestUtil.repeat('b', Segment.SIZE));
+    Buffer write3 = new Buffer().writeUtf8(TestUtil.repeat('c', Segment.SIZE));
+
+    Buffer source = new Buffer().writeUtf8(""
+        + TestUtil.repeat('a', Segment.SIZE)
+        + TestUtil.repeat('b', Segment.SIZE)
+        + TestUtil.repeat('c', Segment.SIZE));
+
+    MockSink mockSink = new MockSink();
+    BufferedSource bufferedSource = Okio.buffer((Source) source);
+    assertEquals(Segment.SIZE * 3, bufferedSource.readAll(mockSink));
+    mockSink.assertLog(
+        "write(" + write1 + ", " + write1.size() + ")",
+        "write(" + write2 + ", " + write2.size() + ")",
+        "write(" + write3 + ", " + write3.size() + ")");
   }
 }

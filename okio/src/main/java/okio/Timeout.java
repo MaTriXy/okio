@@ -50,7 +50,7 @@ public class Timeout {
       return this;
     }
 
-    @Override public Timeout deadline(long duration, TimeUnit unit) {
+    @Override public Timeout deadlineNanoTime(long deadlineNanoTime) {
       return this;
     }
 
@@ -58,9 +58,13 @@ public class Timeout {
     }
   };
 
-  private long deadlineStart;
-  private long deadlineDurationNanos = -1;
-  private long timeoutNanos = -1;
+  /**
+   * True if {@code deadlineNanoTime} is defined. There is no equivalent to null
+   * or 0 for {@link System#nanoTime}.
+   */
+  private boolean hasDeadline;
+  private long deadlineNanoTime;
+  private long timeoutNanos;
 
   public Timeout() {
   }
@@ -69,36 +73,65 @@ public class Timeout {
    * Wait at most {@code timeout} time before aborting an operation. Using a
    * per-operation timeout means that as long as forward progress is being made,
    * no sequence of operations will fail.
+   *
+   * <p>If {@code timeout == 0}, operations will run indefinitely. (Operating
+   * system timeouts may still apply.)
    */
   public Timeout timeout(long timeout, TimeUnit unit) {
-    if (timeout <= 0) throw new IllegalArgumentException("timeout <= 0: " + timeout);
+    if (timeout < 0) throw new IllegalArgumentException("timeout < 0: " + timeout);
+    if (unit == null) throw new IllegalArgumentException("unit == null");
     this.timeoutNanos = unit.toNanos(timeout);
     return this;
   }
 
-  /** Returns the timeout in nanoseconds, or {@code -1} if for no timeout. */
-  public long getTimeoutNanos() {
+  /** Returns the timeout in nanoseconds, or {@code 0} for no timeout. */
+  public long timeoutNanos() {
     return timeoutNanos;
   }
 
-  /**
-   * Set a deadline of now plus {@code duration} time. All operations must
-   * complete before the deadline is reached. Use a deadline to set a maximum
-   * bound on the time spent on a sequence of operations.
-   */
-  public Timeout deadline(long duration, TimeUnit unit) {
-    if (duration <= 0) throw new IllegalArgumentException("duration <= 0: " + duration);
-    this.deadlineStart = System.nanoTime();
-    this.deadlineDurationNanos = unit.toNanos(duration);
-    return this;
+  /** Returns true if a deadline is enabled. */
+  public boolean hasDeadline() {
+    return hasDeadline;
   }
 
   /**
-   * Clears the timeout and deadline. Operating system timeouts may still apply.
+   * Returns the {@linkplain System#nanoTime() nano time} when the deadline will
+   * be reached.
+   *
+   * @throws IllegalStateException if no deadline is set.
    */
-  public Timeout clear() {
-    this.deadlineDurationNanos = -1;
-    this.timeoutNanos = -1;
+  public long deadlineNanoTime() {
+    if (!hasDeadline) throw new IllegalStateException("No deadline");
+    return deadlineNanoTime;
+  }
+
+  /**
+   * Sets the {@linkplain System#nanoTime() nano time} when the deadline will be
+   * reached. All operations must complete before this time. Use a deadline to
+   * set a maximum bound on the time spent on a sequence of operations.
+   */
+  public Timeout deadlineNanoTime(long deadlineNanoTime) {
+    this.hasDeadline = true;
+    this.deadlineNanoTime = deadlineNanoTime;
+    return this;
+  }
+
+  /** Set a deadline of now plus {@code duration} time. */
+  public final Timeout deadline(long duration, TimeUnit unit) {
+    if (duration <= 0) throw new IllegalArgumentException("duration <= 0: " + duration);
+    if (unit == null) throw new IllegalArgumentException("unit == null");
+    return deadlineNanoTime(System.nanoTime() + unit.toNanos(duration));
+  }
+
+  /** Clears the timeout. Operating system timeouts may still apply. */
+  public Timeout clearTimeout() {
+    this.timeoutNanos = 0;
+    return this;
+  }
+
+  /** Clears the deadline. */
+  public Timeout clearDeadline() {
+    this.hasDeadline = false;
     return this;
   }
 
@@ -113,10 +146,8 @@ public class Timeout {
       throw new InterruptedIOException();
     }
 
-    if (deadlineDurationNanos != -1) {
-      long now = System.nanoTime();
-      long elapsed = now - deadlineStart;
-      if (elapsed > deadlineDurationNanos) throw new IOException("deadline reached");
+    if (hasDeadline && System.nanoTime() > deadlineNanoTime) {
+      throw new IOException("deadline reached");
     }
   }
 }

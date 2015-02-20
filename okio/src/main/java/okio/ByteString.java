@@ -18,10 +18,16 @@ package okio;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.io.OutputStream;
+import java.io.Serializable;
+import java.lang.reflect.Field;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
+
+import static okio.Util.checkOffsetAndCount;
 
 /**
  * An immutable sequence of bytes.
@@ -34,9 +40,10 @@ import java.util.Arrays;
  * and other environments that run both trusted and untrusted code in the same
  * process.
  */
-public final class ByteString {
+public final class ByteString implements Serializable {
   private static final char[] HEX_DIGITS =
       { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f' };
+  private static final long serialVersionUID = 1L;
 
   /** A singleton empty {@code ByteString}. */
   public static final ByteString EMPTY = ByteString.of();
@@ -53,11 +60,26 @@ public final class ByteString {
    * Returns a new byte string containing a clone of the bytes of {@code data}.
    */
   public static ByteString of(byte... data) {
+    if (data == null) throw new IllegalArgumentException("data == null");
     return new ByteString(data.clone());
+  }
+
+  /**
+   * Returns a new byte string containing a copy of {@code byteCount} bytes of {@code data} starting
+   * at {@code offset}.
+   */
+  public static ByteString of(byte[] data, int offset, int byteCount) {
+    if (data == null) throw new IllegalArgumentException("data == null");
+    checkOffsetAndCount(data.length, offset, byteCount);
+
+    byte[] copy = new byte[byteCount];
+    System.arraycopy(data, offset, copy, 0, byteCount);
+    return new ByteString(copy);
   }
 
   /** Returns a new byte string containing the {@code UTF-8} bytes of {@code s}. */
   public static ByteString encodeUtf8(String s) {
+    if (s == null) throw new IllegalArgumentException("s == null");
     ByteString byteString = new ByteString(s.getBytes(Util.UTF_8));
     byteString.utf8 = s;
     return byteString;
@@ -84,6 +106,7 @@ public final class ByteString {
    * Returns null if {@code base64} is not a Base64-encoded sequence of bytes.
    */
   public static ByteString decodeBase64(String base64) {
+    if (base64 == null) throw new IllegalArgumentException("base64 == null");
     byte[] decoded = Base64.decode(base64);
     return decoded != null ? new ByteString(decoded) : null;
   }
@@ -101,6 +124,7 @@ public final class ByteString {
 
   /** Decodes the hex-encoded bytes and returns their value a byte string. */
   public static ByteString decodeHex(String hex) {
+    if (hex == null) throw new IllegalArgumentException("hex == null");
     if (hex.length() % 2 != 0) throw new IllegalArgumentException("Unexpected hex string: " + hex);
 
     byte[] result = new byte[hex.length() / 2];
@@ -126,6 +150,9 @@ public final class ByteString {
    *     bytes to read.
    */
   public static ByteString read(InputStream in, int byteCount) throws IOException {
+    if (in == null) throw new IllegalArgumentException("in == null");
+    if (byteCount < 0) throw new IllegalArgumentException("byteCount < 0: " + byteCount);
+
     byte[] result = new byte[byteCount];
     for (int offset = 0, read; offset < byteCount; offset += read) {
       read = in.read(result, offset, byteCount - offset);
@@ -184,6 +211,37 @@ public final class ByteString {
     return this;
   }
 
+  /**
+   * Returns a byte string that is a substring of this byte string, beginning at the specified 
+   * index until the end of this string. Returns this byte string if {@code beginIndex} is 0.
+   */
+  public ByteString substring(int beginIndex) {
+    return substring(beginIndex, data.length);
+  }
+
+  /**
+   * Returns a byte string that is a substring of this byte string, beginning at the specified 
+   * {@code beginIndex} and ends at the specified {@code endIndex}. Returns this byte string if 
+   * {@code beginIndex} is 0 and {@code endIndex} is the length of this byte string.
+   */
+  public ByteString substring(int beginIndex, int endIndex) {
+    if (beginIndex < 0) throw new IllegalArgumentException("beginIndex < 0");
+    if (endIndex > data.length) {
+      throw new IllegalArgumentException("endIndex > length(" + data.length + ")");
+    }
+    
+    int subLen = endIndex - beginIndex;
+    if (subLen < 0) throw new IllegalArgumentException("endIndex < beginIndex");
+    
+    if ((beginIndex == 0) && (endIndex == data.length)) {
+      return this;
+    }
+
+    byte[] copy = new byte[subLen];
+    System.arraycopy(data, beginIndex, copy, 0, subLen);
+    return new ByteString(copy);
+  }
+
   /** Returns the byte at {@code pos}. */
   public byte getByte(int pos) {
     return data[pos];
@@ -205,6 +263,7 @@ public final class ByteString {
 
   /** Writes the contents of this byte string to {@code out}. */
   public void write(OutputStream out) throws IOException {
+    if (out == null) throw new IllegalArgumentException("out == null");
     out.write(data);
   }
 
@@ -232,5 +291,24 @@ public final class ByteString {
     } catch (NoSuchAlgorithmException e) {
       throw new AssertionError();
     }
+  }
+
+  private void readObject(ObjectInputStream in) throws IOException {
+    int dataLength = in.readInt();
+    ByteString byteString = ByteString.read(in, dataLength);
+    try {
+      Field field = ByteString.class.getDeclaredField("data");
+      field.setAccessible(true);
+      field.set(this, byteString.data);
+    } catch (NoSuchFieldException e) {
+      throw new AssertionError();
+    } catch (IllegalAccessException e) {
+      throw new AssertionError();
+    }
+  }
+
+  private void writeObject(ObjectOutputStream out) throws IOException {
+    out.writeInt(data.length);
+    out.write(data);
   }
 }

@@ -20,28 +20,23 @@ import java.io.OutputStream;
 import org.junit.Test;
 
 import static okio.TestUtil.repeat;
-import static okio.Util.UTF_8;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
+/**
+ * Tests solely for the behavior of RealBufferedSink's implementation. For generic
+ * BufferedSink behavior use BufferedSinkTest.
+ */
 public final class RealBufferedSinkTest {
-  @Test public void outputStreamFromSink() throws Exception {
-    Buffer sink = new Buffer();
-    OutputStream out = new RealBufferedSink(sink).outputStream();
-    out.write('a');
-    out.write(repeat('b', 9998).getBytes(UTF_8));
-    out.write('c');
-    out.flush();
-    assertEquals("a" + repeat('b', 9998) + "c", sink.readUtf8(10000));
-  }
-
-  @Test public void outputStreamFromSinkBounds() throws Exception {
-    Buffer sink = new Buffer();
-    OutputStream out = new RealBufferedSink(sink).outputStream();
+  @Test public void inputStreamCloses() throws Exception {
+    RealBufferedSink sink = new RealBufferedSink(new Buffer());
+    OutputStream out = sink.outputStream();
+    out.close();
     try {
-      out.write(new byte[100], 50, 51);
+      sink.writeUtf8("Hi!");
       fail();
-    } catch (ArrayIndexOutOfBoundsException expected) {
+    } catch (IllegalStateException e) {
+      assertEquals("closed", e.getMessage());
     }
   }
 
@@ -53,13 +48,6 @@ public final class RealBufferedSinkTest {
     bufferedSink.writeByte(0);
     assertEquals(Segment.SIZE, sink.size());
     assertEquals(0, bufferedSink.buffer().size());
-  }
-
-  @Test public void bufferedSinkEmitZero() throws IOException {
-    Buffer sink = new Buffer();
-    BufferedSink bufferedSink = new RealBufferedSink(sink);
-    bufferedSink.writeUtf8("");
-    assertEquals(0, sink.size());
   }
 
   @Test public void bufferedSinkEmitMultipleSegments() throws IOException {
@@ -95,6 +83,14 @@ public final class RealBufferedSinkTest {
     assertEquals(0, sink.size());
   }
 
+  @Test public void bytesEmittedToSinkWithEmit() throws Exception {
+    Buffer sink = new Buffer();
+    BufferedSink bufferedSink = new RealBufferedSink(sink);
+    bufferedSink.writeUtf8("abc");
+    bufferedSink.emit();
+    assertEquals(3, sink.size());
+  }
+
   @Test public void completeSegmentsEmitted() throws Exception {
     Buffer sink = new Buffer();
     BufferedSink bufferedSink = new RealBufferedSink(sink);
@@ -107,14 +103,6 @@ public final class RealBufferedSinkTest {
     BufferedSink bufferedSink = new RealBufferedSink(sink);
     bufferedSink.writeUtf8(repeat('a', Segment.SIZE * 3 - 1));
     assertEquals(Segment.SIZE * 2, sink.size());
-  }
-
-  @Test public void closeEmitsBufferedBytes() throws IOException {
-    Buffer sink = new Buffer();
-    BufferedSink bufferedSink = new RealBufferedSink(sink);
-    bufferedSink.writeByte('a');
-    bufferedSink.close();
-    assertEquals('a', sink.readByte());
   }
 
   @Test public void closeWithExceptionWhenWriting() throws IOException {
@@ -184,6 +172,12 @@ public final class RealBufferedSinkTest {
     }
 
     try {
+      bufferedSink.emit();
+      fail();
+    } catch (IllegalStateException expected) {
+    }
+
+    try {
       bufferedSink.flush();
       fail();
     } catch (IllegalStateException expected) {
@@ -206,4 +200,45 @@ public final class RealBufferedSinkTest {
     // Permitted
     os.flush();
   }
+
+  @Test public void writeAll() throws IOException {
+    MockSink mockSink = new MockSink();
+    BufferedSink bufferedSink = Okio.buffer(mockSink);
+
+    bufferedSink.buffer().writeUtf8("abc");
+    assertEquals(3, bufferedSink.writeAll(new Buffer().writeUtf8("def")));
+
+    assertEquals(6, bufferedSink.buffer().size());
+    assertEquals("abcdef", bufferedSink.buffer().readUtf8(6));
+    mockSink.assertLog(); // No writes.
+ }
+
+  @Test public void writeAllExhausted() throws IOException {
+    MockSink mockSink = new MockSink();
+    BufferedSink bufferedSink = Okio.buffer(mockSink);
+
+    assertEquals(0, bufferedSink.writeAll(new Buffer()));
+    assertEquals(0, bufferedSink.buffer().size());
+    mockSink.assertLog(); // No writes.
+ }
+
+  @Test public void writeAllWritesOneSegmentAtATime() throws IOException {
+    Buffer write1 = new Buffer().writeUtf8(TestUtil.repeat('a', Segment.SIZE));
+    Buffer write2 = new Buffer().writeUtf8(TestUtil.repeat('b', Segment.SIZE));
+    Buffer write3 = new Buffer().writeUtf8(TestUtil.repeat('c', Segment.SIZE));
+
+    Buffer source = new Buffer().writeUtf8(""
+        + TestUtil.repeat('a', Segment.SIZE)
+        + TestUtil.repeat('b', Segment.SIZE)
+        + TestUtil.repeat('c', Segment.SIZE));
+
+    MockSink mockSink = new MockSink();
+    BufferedSink bufferedSink = Okio.buffer(mockSink);
+    assertEquals(Segment.SIZE * 3, bufferedSink.writeAll(source));
+
+    mockSink.assertLog(
+        "write(" + write1 + ", " + write1.size() + ")",
+        "write(" + write2 + ", " + write2.size() + ")",
+        "write(" + write3 + ", " + write3.size() + ")");
+ }
 }

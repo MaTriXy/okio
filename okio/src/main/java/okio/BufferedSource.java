@@ -41,6 +41,13 @@ public interface BufferedSource extends Source {
    */
   void require(long byteCount) throws IOException;
 
+  /**
+   * Returns true when the buffer contains at least {@code byteCount} bytes,
+   * expanding it as necessary. Returns false if the source is exhausted before
+   * the requested bytes can be read.
+   */
+  boolean request(long byteCount) throws IOException;
+
   /** Removes a byte from this source and returns it. */
   byte readByte() throws IOException;
 
@@ -69,8 +76,35 @@ public interface BufferedSource extends Source {
    */
   void skip(long byteCount) throws IOException;
 
+  /** Removes all bytes bytes from this and returns them as a byte string. */
+  ByteString readByteString() throws IOException;
+
   /** Removes {@code byteCount} bytes from this and returns them as a byte string. */
   ByteString readByteString(long byteCount) throws IOException;
+
+  /** Removes all bytes from this and returns them as a byte array. */
+  byte[] readByteArray() throws IOException;
+
+  /** Removes {@code byteCount} bytes from this and returns them as a byte array. */
+  byte[] readByteArray(long byteCount) throws IOException;
+
+  /**
+   * Removes up to {@code sink.length} bytes from this and copies them into {@code sink}.
+   * Returns the number of bytes read, or -1 if this source is exhausted.
+   */
+  int read(byte[] sink) throws IOException;
+
+  /**
+   * Removes exactly {@code sink.length} bytes from this and copies them into {@code sink}.
+   * Throws an {@link java.io.EOFException} if the requested number of bytes cannot be read.
+   */
+  void readFully(byte[] sink) throws IOException;
+
+  /**
+   * Removes up to {@code byteCount} bytes from this and copies them into {@code sink} at
+   * {@code offset}. Returns the number of bytes read, or -1 if this source is exhausted.
+   */
+  int read(byte[] sink, int offset, int byteCount) throws IOException;
 
   /**
    * Removes exactly {@code byteCount} bytes from this and appends them to
@@ -80,7 +114,17 @@ public interface BufferedSource extends Source {
   void readFully(Buffer sink, long byteCount) throws IOException;
 
   /**
-   * Removes {@code byteCount} bytes from this, decodes them as UTF-8 and
+   * Removes all bytes from this and appends them to {@code sink}. Returns the
+   * total number of bytes written to {@code sink} which will be 0 if this is
+   * exhausted.
+   */
+  long readAll(Sink sink) throws IOException;
+
+  /** Removes all bytes from this, decodes them as UTF-8, and returns the string. */
+  String readUtf8() throws IOException;
+
+  /**
+   * Removes {@code byteCount} bytes from this, decodes them as UTF-8, and
    * returns the string.
    */
   String readUtf8(long byteCount) throws IOException;
@@ -111,17 +155,49 @@ public interface BufferedSource extends Source {
   String readUtf8LineStrict() throws IOException;
 
   /**
+   * Removes all bytes from this, decodes them as {@code charset}, and returns
+   * the string.
+   */
+  String readString(Charset charset) throws IOException;
+
+  /**
    * Removes {@code byteCount} bytes from this, decodes them as {@code charset},
    * and returns the string.
    */
   String readString(long byteCount, Charset charset) throws IOException;
 
   /**
-   * Returns the index of {@code b} in the buffer, refilling it if necessary
-   * until it is found. This reads an unbounded number of bytes into the buffer.
-   * Returns -1 if the stream is exhausted before the requested byte is found.
+   * Returns the index of the first {@code b} in the buffer. This expands the
+   * buffer as necessary until {@code b} is found. This reads an unbounded
+   * number of bytes into the buffer. Returns -1 if the stream is exhausted
+   * before the requested byte is found.
    */
   long indexOf(byte b) throws IOException;
+
+  /**
+   * Returns the index of the first {@code b} in the buffer at or after {@code
+   * fromIndex}. This expands the buffer as necessary until {@code b} is found.
+   * This reads an unbounded number of bytes into the buffer. Returns -1 if the
+   * stream is exhausted before the requested byte is found.
+   */
+  long indexOf(byte b, long fromIndex) throws IOException;
+
+  /**
+   * Returns the index of the first byte in {@code targetBytes} in the buffer.
+   * This expands the buffer as necessary until a target byte is found. This
+   * reads an unbounded number of bytes into the buffer. Returns -1 if the
+   * stream is exhausted before the requested byte is found.
+   */
+  long indexOfElement(ByteString targetBytes) throws IOException;
+
+  /**
+   * Returns the index of the first byte in {@code targetBytes} in the buffer
+   * at or after {@code fromIndex}. This expands the buffer as necessary until
+   * a target byte is found. This reads an unbounded number of bytes into the
+   * buffer. Returns -1 if the stream is exhausted before the requested byte is
+   * found.
+   */
+  long indexOfElement(ByteString targetBytes, long fromIndex) throws IOException;
 
   /** Returns an input stream that reads from this source. */
   InputStream inputStream();

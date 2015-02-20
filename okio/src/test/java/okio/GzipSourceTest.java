@@ -98,7 +98,7 @@ public class GzipSourceTest {
 
   private void assertGzipped(Buffer gzipped) throws IOException {
     Buffer gunzipped = gunzip(gzipped);
-    assertEquals("It's a UNIX system! I know this!", gunzipped.readUtf8(gunzipped.size()));
+    assertEquals("It's a UNIX system! I know this!", gunzipped.readUtf8());
   }
 
   /**
@@ -207,7 +207,7 @@ public class GzipSourceTest {
     return result;
   }
 
-  /** This source keeps track of whether its read have returned -1. */
+  /** This source keeps track of whether its read has returned -1. */
   static class ExhaustableSource implements Source {
     private final Source source;
     private boolean exhausted;

@@ -75,6 +75,23 @@ final class RealBufferedSink implements BufferedSink {
     return emitCompleteSegments();
   }
 
+  @Override public long writeAll(Source source) throws IOException {
+    if (source == null) throw new IllegalArgumentException("source == null");
+    long totalBytesRead = 0;
+    for (long readCount; (readCount = source.read(buffer, Segment.SIZE)) != -1; ) {
+      totalBytesRead += readCount;
+      emitCompleteSegments();
+    }
+    return totalBytesRead;
+  }
+
+  @Override public BufferedSink write(Source source, long byteCount) throws IOException {
+    if (byteCount > 0) {
+      source.read(buffer, byteCount);
+    }
+    return this;
+  }
+
   @Override public BufferedSink writeByte(int b) throws IOException {
     if (closed) throw new IllegalStateException("closed");
     buffer.writeByte(b);
@@ -120,6 +137,13 @@ final class RealBufferedSink implements BufferedSink {
   @Override public BufferedSink emitCompleteSegments() throws IOException {
     if (closed) throw new IllegalStateException("closed");
     long byteCount = buffer.completeSegmentByteCount();
+    if (byteCount > 0) sink.write(buffer, byteCount);
+    return this;
+  }
+
+  @Override public BufferedSink emit() throws IOException {
+    if (closed) throw new IllegalStateException("closed");
+    long byteCount = buffer.size();
     if (byteCount > 0) sink.write(buffer, byteCount);
     return this;
   }
