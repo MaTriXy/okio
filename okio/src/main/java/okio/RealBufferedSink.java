@@ -15,23 +15,19 @@
  */
 package okio;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.Charset;
 
 final class RealBufferedSink implements BufferedSink {
-  public final Buffer buffer;
+  public final Buffer buffer = new Buffer();
   public final Sink sink;
-  private boolean closed;
+  boolean closed;
 
-  public RealBufferedSink(Sink sink, Buffer buffer) {
-    if (sink == null) throw new IllegalArgumentException("sink == null");
-    this.buffer = buffer;
+  RealBufferedSink(Sink sink) {
+    if (sink == null) throw new NullPointerException("sink == null");
     this.sink = sink;
-  }
-
-  public RealBufferedSink(Sink sink) {
-    this(sink, new Buffer());
   }
 
   @Override public Buffer buffer() {
@@ -57,9 +53,29 @@ final class RealBufferedSink implements BufferedSink {
     return emitCompleteSegments();
   }
 
+  @Override public BufferedSink writeUtf8(String string, int beginIndex, int endIndex)
+      throws IOException {
+    if (closed) throw new IllegalStateException("closed");
+    buffer.writeUtf8(string, beginIndex, endIndex);
+    return emitCompleteSegments();
+  }
+
+  @Override public BufferedSink writeUtf8CodePoint(int codePoint) throws IOException {
+    if (closed) throw new IllegalStateException("closed");
+    buffer.writeUtf8CodePoint(codePoint);
+    return emitCompleteSegments();
+  }
+
   @Override public BufferedSink writeString(String string, Charset charset) throws IOException {
     if (closed) throw new IllegalStateException("closed");
     buffer.writeString(string, charset);
+    return emitCompleteSegments();
+  }
+
+  @Override public BufferedSink writeString(String string, int beginIndex, int endIndex,
+      Charset charset) throws IOException {
+    if (closed) throw new IllegalStateException("closed");
+    buffer.writeString(string, beginIndex, endIndex, charset);
     return emitCompleteSegments();
   }
 
@@ -86,8 +102,11 @@ final class RealBufferedSink implements BufferedSink {
   }
 
   @Override public BufferedSink write(Source source, long byteCount) throws IOException {
-    if (byteCount > 0) {
-      source.read(buffer, byteCount);
+    while (byteCount > 0) {
+      long read = source.read(buffer, byteCount);
+      if (read == -1) throw new EOFException();
+      byteCount -= read;
+      emitCompleteSegments();
     }
     return this;
   }
@@ -131,6 +150,18 @@ final class RealBufferedSink implements BufferedSink {
   @Override public BufferedSink writeLongLe(long v) throws IOException {
     if (closed) throw new IllegalStateException("closed");
     buffer.writeLongLe(v);
+    return emitCompleteSegments();
+  }
+
+  @Override public BufferedSink writeDecimalLong(long v) throws IOException {
+    if (closed) throw new IllegalStateException("closed");
+    buffer.writeDecimalLong(v);
+    return emitCompleteSegments();
+  }
+
+  @Override public BufferedSink writeHexadecimalUnsignedLong(long v) throws IOException {
+    if (closed) throw new IllegalStateException("closed");
+    buffer.writeHexadecimalUnsignedLong(v);
     return emitCompleteSegments();
   }
 

@@ -19,11 +19,13 @@ import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Random;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import org.junit.Before;
 import org.junit.Test;
 
+import static okio.TestUtil.bufferWithRandomSegmentLayout;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -33,8 +35,8 @@ import static org.junit.Assert.fail;
  * This test uses four timeouts of varying durations: 250ms, 500ms, 750ms and
  * 1000ms, named 'a', 'b', 'c' and 'd'.
  */
-public class AsyncTimeoutTest {
-  private final List<Timeout> timedOut = new CopyOnWriteArrayList<Timeout>();
+public final class AsyncTimeoutTest {
+  private final List<Timeout> timedOut = new CopyOnWriteArrayList<>();
   private final AsyncTimeout a = new RecordingAsyncTimeout();
   private final AsyncTimeout b = new RecordingAsyncTimeout();
   private final AsyncTimeout c = new RecordingAsyncTimeout();
@@ -192,8 +194,9 @@ public class AsyncTimeoutTest {
     AsyncTimeout timeout = new AsyncTimeout();
     timeout.timeout(250, TimeUnit.MILLISECONDS);
     Sink timeoutSink = timeout.sink(sink);
+    Buffer data = new Buffer().writeUtf8("a");
     try {
-      timeoutSink.write(null, 0);
+      timeoutSink.write(data, 1);
       fail();
     } catch (InterruptedIOException expected) {
     }
@@ -234,8 +237,9 @@ public class AsyncTimeoutTest {
     AsyncTimeout timeout = new AsyncTimeout();
     timeout.timeout(250, TimeUnit.MILLISECONDS);
     Sink timeoutSink = timeout.sink(sink);
+    Buffer data = new Buffer().writeUtf8("a");
     try {
-      timeoutSink.write(null, 0);
+      timeoutSink.write(data, 1);
       fail();
     } catch (InterruptedIOException expected) {
       assertEquals("timeout", expected.getMessage());
@@ -252,12 +256,48 @@ public class AsyncTimeoutTest {
     AsyncTimeout timeout = new AsyncTimeout();
     timeout.timeout(250, TimeUnit.MILLISECONDS);
     Sink timeoutSink = timeout.sink(sink);
+    Buffer data = new Buffer().writeUtf8("a");
     try {
-      timeoutSink.write(null, 0);
+      timeoutSink.write(data, 1);
       fail();
     } catch (IOException expected) {
       assertEquals("no timeout occurred", expected.getMessage());
     }
+  }
+
+  /**
+   * We had a bug where writing a very large buffer would fail with an
+   * unexpected timeout because although the sink was making steady forward
+   * progress, doing it all as a single write caused a timeout.
+   */
+  @Test public void sinkSplitsLargeWrites() throws Exception {
+    byte[] data = new byte[512 * 1024];
+    Random dice = new Random(0);
+    dice.nextBytes(data);
+    final Buffer source = bufferWithRandomSegmentLayout(dice, data);
+    final Buffer target = new Buffer();
+
+    Sink sink = new ForwardingSink(new Buffer()) {
+      @Override public void write(Buffer source, long byteCount) throws IOException {
+        try {
+          Thread.sleep(byteCount / 500); // ~500 KiB/s.
+          target.write(source, byteCount);
+        } catch (InterruptedException e) {
+          throw new AssertionError();
+        }
+      }
+    };
+
+    // Timeout after 250 ms of inactivity.
+    AsyncTimeout timeout = new AsyncTimeout();
+    timeout.timeout(250, TimeUnit.MILLISECONDS);
+    Sink timeoutSink = timeout.sink(sink);
+
+    // Transmit 500 KiB of data, which should take ~1 second. But expect no timeout!
+    timeoutSink.write(source, source.size());
+
+    // The data should all have arrived.
+    assertEquals(ByteString.of(data), target.readByteString());
   }
 
   /** Asserts which timeouts fired, and in which order. */

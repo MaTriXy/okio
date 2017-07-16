@@ -19,22 +19,18 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.Charset;
+import javax.annotation.Nullable;
 
 import static okio.Util.checkOffsetAndCount;
 
 final class RealBufferedSource implements BufferedSource {
-  public final Buffer buffer;
+  public final Buffer buffer = new Buffer();
   public final Source source;
-  private boolean closed;
+  boolean closed;
 
-  public RealBufferedSource(Source source, Buffer buffer) {
-    if (source == null) throw new IllegalArgumentException("source == null");
-    this.buffer = buffer;
+  RealBufferedSource(Source source) {
+    if (source == null) throw new NullPointerException("source == null");
     this.source = source;
-  }
-
-  public RealBufferedSource(Source source) {
-    this(source, new Buffer());
   }
 
   @Override public Buffer buffer() {
@@ -88,6 +84,25 @@ final class RealBufferedSource implements BufferedSource {
     return buffer.readByteString(byteCount);
   }
 
+  @Override public int select(Options options) throws IOException {
+    if (closed) throw new IllegalStateException("closed");
+
+    while (true) {
+      int index = buffer.selectPrefix(options);
+      if (index == -1) return -1;
+
+      // If the prefix match actually matched a full byte string, consume it and return it.
+      int selectedSize = options.byteStrings[index].size();
+      if (selectedSize <= buffer.size) {
+        buffer.skip(selectedSize);
+        return index;
+      }
+
+      // We need to grow the buffer. Do that, then try it all again.
+      if (source.read(buffer, Segment.SIZE) == -1) return -1;
+    }
+  }
+
   @Override public byte[] readByteArray() throws IOException {
     buffer.writeAll(source);
     return buffer.readByteArray();
@@ -109,7 +124,7 @@ final class RealBufferedSource implements BufferedSource {
       // The underlying source is exhausted. Copy the bytes we got before rethrowing.
       int offset = 0;
       while (buffer.size > 0) {
-        int read = buffer.read(sink, offset, (int) buffer.size - offset);
+        int read = buffer.read(sink, offset, (int) buffer.size);
         if (read == -1) throw new AssertionError();
         offset += read;
       }
@@ -182,7 +197,7 @@ final class RealBufferedSource implements BufferedSource {
     return buffer.readString(byteCount, charset);
   }
 
-  @Override public String readUtf8Line() throws IOException {
+  @Override public @Nullable String readUtf8Line() throws IOException {
     long newline = indexOf((byte) '\n');
 
     if (newline == -1) {
@@ -193,14 +208,38 @@ final class RealBufferedSource implements BufferedSource {
   }
 
   @Override public String readUtf8LineStrict() throws IOException {
-    long newline = indexOf((byte) '\n');
-    if (newline == -1L) {
-      Buffer data = new Buffer();
-      buffer.copyTo(data, 0, Math.min(32, buffer.size()));
-      throw new EOFException("\\n not found: size=" + buffer.size()
-          + " content=" + data.readByteString().hex() + "...");
+    return readUtf8LineStrict(Long.MAX_VALUE);
+  }
+
+  @Override public String readUtf8LineStrict(long limit) throws IOException {
+    if (limit < 0) throw new IllegalArgumentException("limit < 0: " + limit);
+    long scanLength = limit == Long.MAX_VALUE ? Long.MAX_VALUE : limit + 1;
+    long newline = indexOf((byte) '\n', 0, scanLength);
+    if (newline != -1) return buffer.readUtf8Line(newline);
+    if (scanLength < Long.MAX_VALUE
+        && request(scanLength) && buffer.getByte(scanLength - 1) == '\r'
+        && request(scanLength + 1) && buffer.getByte(scanLength) == '\n') {
+      return buffer.readUtf8Line(scanLength); // The line was 'limit' UTF-8 bytes followed by \r\n.
     }
-    return buffer.readUtf8Line(newline);
+    Buffer data = new Buffer();
+    buffer.copyTo(data, 0, Math.min(32, buffer.size()));
+    throw new EOFException("\\n not found: limit=" + Math.min(buffer.size(), limit)
+        + " content=" + data.readByteString().hex() + '…');
+  }
+
+  @Override public int readUtf8CodePoint() throws IOException {
+    require(1);
+
+    byte b0 = buffer.getByte(0);
+    if ((b0 & 0xe0) == 0xc0) {
+      require(2);
+    } else if ((b0 & 0xf0) == 0xe0) {
+      require(3);
+    } else if ((b0 & 0xf8) == 0xf0) {
+      require(4);
+    }
+
+    return buffer.readUtf8CodePoint();
   }
 
   @Override public short readShort() throws IOException {
@@ -233,6 +272,42 @@ final class RealBufferedSource implements BufferedSource {
     return buffer.readLongLe();
   }
 
+  @Override public long readDecimalLong() throws IOException {
+    require(1);
+
+    for (int pos = 0; request(pos + 1); pos++) {
+      byte b = buffer.getByte(pos);
+      if ((b < '0' || b > '9') && (pos != 0 || b != '-')) {
+        // Non-digit, or non-leading negative sign.
+        if (pos == 0) {
+          throw new NumberFormatException(String.format(
+              "Expected leading [0-9] or '-' character but was %#x", b));
+        }
+        break;
+      }
+    }
+
+    return buffer.readDecimalLong();
+  }
+
+  @Override public long readHexadecimalUnsignedLong() throws IOException {
+    require(1);
+
+    for (int pos = 0; request(pos + 1); pos++) {
+      byte b = buffer.getByte(pos);
+      if ((b < '0' || b > '9') && (b < 'a' || b > 'f') && (b < 'A' || b > 'F')) {
+        // Non-digit, or non-leading negative sign.
+        if (pos == 0) {
+          throw new NumberFormatException(String.format(
+              "Expected leading [0-9a-fA-F] character but was %#x", b));
+        }
+        break;
+      }
+    }
+
+    return buffer.readHexadecimalUnsignedLong();
+  }
+
   @Override public void skip(long byteCount) throws IOException {
     if (closed) throw new IllegalStateException("closed");
     while (byteCount > 0) {
@@ -246,20 +321,52 @@ final class RealBufferedSource implements BufferedSource {
   }
 
   @Override public long indexOf(byte b) throws IOException {
-    return indexOf(b, 0);
+    return indexOf(b, 0, Long.MAX_VALUE);
   }
 
   @Override public long indexOf(byte b, long fromIndex) throws IOException {
+    return indexOf(b, fromIndex, Long.MAX_VALUE);
+  }
+
+  @Override public long indexOf(byte b, long fromIndex, long toIndex) throws IOException {
     if (closed) throw new IllegalStateException("closed");
-    while (fromIndex >= buffer.size) {
-      if (source.read(buffer, Segment.SIZE) == -1) return -1L;
+    if (fromIndex < 0 || toIndex < fromIndex) {
+      throw new IllegalArgumentException(
+          String.format("fromIndex=%s toIndex=%s", fromIndex, toIndex));
     }
-    long index;
-    while ((index = buffer.indexOf(b, fromIndex)) == -1) {
-      fromIndex = buffer.size;
-      if (source.read(buffer, Segment.SIZE) == -1) return -1L;
+
+    while (fromIndex < toIndex) {
+      long result = buffer.indexOf(b, fromIndex, toIndex);
+      if (result != -1L) return result;
+
+      // The byte wasn't in the buffer. Give up if we've already reached our target size or if the
+      // underlying stream is exhausted.
+      long lastBufferSize = buffer.size;
+      if (lastBufferSize >= toIndex || source.read(buffer, Segment.SIZE) == -1) return -1L;
+
+      // Continue the search from where we left off.
+      fromIndex = Math.max(fromIndex, lastBufferSize);
     }
-    return index;
+    return -1L;
+  }
+
+  @Override public long indexOf(ByteString bytes) throws IOException {
+    return indexOf(bytes, 0);
+  }
+
+  @Override public long indexOf(ByteString bytes, long fromIndex) throws IOException {
+    if (closed) throw new IllegalStateException("closed");
+
+    while (true) {
+      long result = buffer.indexOf(bytes, fromIndex);
+      if (result != -1) return result;
+
+      long lastBufferSize = buffer.size;
+      if (source.read(buffer, Segment.SIZE) == -1) return -1L;
+
+      // Keep searching, picking up from where we left off.
+      fromIndex = Math.max(fromIndex, lastBufferSize - bytes.size() + 1);
+    }
   }
 
   @Override public long indexOfElement(ByteString targetBytes) throws IOException {
@@ -268,15 +375,40 @@ final class RealBufferedSource implements BufferedSource {
 
   @Override public long indexOfElement(ByteString targetBytes, long fromIndex) throws IOException {
     if (closed) throw new IllegalStateException("closed");
-    while (fromIndex >= buffer.size) {
+
+    while (true) {
+      long result = buffer.indexOfElement(targetBytes, fromIndex);
+      if (result != -1) return result;
+
+      long lastBufferSize = buffer.size;
       if (source.read(buffer, Segment.SIZE) == -1) return -1L;
+
+      // Keep searching, picking up from where we left off.
+      fromIndex = Math.max(fromIndex, lastBufferSize);
     }
-    long index;
-    while ((index = buffer.indexOfElement(targetBytes, fromIndex)) == -1) {
-      fromIndex = buffer.size;
-      if (source.read(buffer, Segment.SIZE) == -1) return -1L;
+  }
+
+  @Override public boolean rangeEquals(long offset, ByteString bytes) throws IOException {
+    return rangeEquals(offset, bytes, 0, bytes.size());
+  }
+
+  @Override
+  public boolean rangeEquals(long offset, ByteString bytes, int bytesOffset, int byteCount)
+      throws IOException {
+    if (closed) throw new IllegalStateException("closed");
+
+    if (offset < 0
+        || bytesOffset < 0
+        || byteCount < 0
+        || bytes.size() - bytesOffset < byteCount) {
+      return false;
     }
-    return index;
+    for (int i = 0; i < byteCount; i++) {
+      long bufferOffset = offset + i;
+      if (!request(bufferOffset + 1)) return false;
+      if (buffer.getByte(bufferOffset) != bytes.getByte(bytesOffset + i)) return false;
+    }
+    return true;
   }
 
   @Override public InputStream inputStream() {

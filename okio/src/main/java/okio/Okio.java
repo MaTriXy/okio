@@ -21,20 +21,23 @@ import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.file.Files;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import javax.annotation.Nullable;
 import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
 
 import static okio.Util.checkOffsetAndCount;
 
 /** Essential APIs for working with Okio. */
 public final class Okio {
-  private static final Logger logger = Logger.getLogger(Okio.class.getName());
+  static final Logger logger = Logger.getLogger(Okio.class.getName());
 
   private Okio() {
   }
@@ -45,7 +48,6 @@ public final class Okio {
    * you read a source to get an ergonomic and efficient access to data.
    */
   public static BufferedSource buffer(Source source) {
-    if (source == null) throw new IllegalArgumentException("source == null");
     return new RealBufferedSource(source);
   }
 
@@ -55,12 +57,11 @@ public final class Okio {
    * get an ergonomic and efficient access to data.
    */
   public static BufferedSink buffer(Sink sink) {
-    if (sink == null) throw new IllegalArgumentException("sink == null");
     return new RealBufferedSink(sink);
   }
 
   /** Returns a sink that writes to {@code out}. */
-  public static Sink sink(final OutputStream out) {
+  public static Sink sink(OutputStream out) {
     return sink(out, new Timeout());
   }
 
@@ -83,7 +84,7 @@ public final class Okio {
 
           if (head.pos == head.limit) {
             source.head = head.pop();
-            SegmentPool.INSTANCE.recycle(head);
+            SegmentPool.recycle(head);
           }
         }
       }
@@ -111,7 +112,7 @@ public final class Okio {
    * #sink(OutputStream)} because this method honors timeouts. When the socket
    * write times out, the socket is asynchronously closed by a watchdog thread.
    */
-  public static Sink sink(final Socket socket) throws IOException {
+  public static Sink sink(Socket socket) throws IOException {
     if (socket == null) throw new IllegalArgumentException("socket == null");
     AsyncTimeout timeout = timeout(socket);
     Sink sink = sink(socket.getOutputStream(), timeout);
@@ -119,7 +120,7 @@ public final class Okio {
   }
 
   /** Returns a source that reads from {@code in}. */
-  public static Source source(final InputStream in) {
+  public static Source source(InputStream in) {
     return source(in, new Timeout());
   }
 
@@ -130,14 +131,20 @@ public final class Okio {
     return new Source() {
       @Override public long read(Buffer sink, long byteCount) throws IOException {
         if (byteCount < 0) throw new IllegalArgumentException("byteCount < 0: " + byteCount);
-        timeout.throwIfReached();
-        Segment tail = sink.writableSegment(1);
-        int maxToCopy = (int) Math.min(byteCount, Segment.SIZE - tail.limit);
-        int bytesRead = in.read(tail.data, tail.limit, maxToCopy);
-        if (bytesRead == -1) return -1;
-        tail.limit += bytesRead;
-        sink.size += bytesRead;
-        return bytesRead;
+        if (byteCount == 0) return 0;
+        try {
+          timeout.throwIfReached();
+          Segment tail = sink.writableSegment(1);
+          int maxToCopy = (int) Math.min(byteCount, Segment.SIZE - tail.limit);
+          int bytesRead = in.read(tail.data, tail.limit, maxToCopy);
+          if (bytesRead == -1) return -1;
+          tail.limit += bytesRead;
+          sink.size += bytesRead;
+          return bytesRead;
+        } catch (AssertionError e) {
+          if (isAndroidGetsocknameError(e)) throw new IOException(e);
+          throw e;
+        }
       }
 
       @Override public void close() throws IOException {
@@ -186,12 +193,31 @@ public final class Okio {
     return sink(Files.newOutputStream(path, options));
   }
 
+  /** Returns a sink that writes nowhere. */
+  public static Sink blackhole() {
+    return new Sink() {
+      @Override public void write(Buffer source, long byteCount) throws IOException {
+        source.skip(byteCount);
+      }
+
+      @Override public void flush() throws IOException {
+      }
+
+      @Override public Timeout timeout() {
+        return Timeout.NONE;
+      }
+
+      @Override public void close() throws IOException {
+      }
+    };
+  }
+
   /**
    * Returns a source that reads from {@code socket}. Prefer this over {@link
    * #source(InputStream)} because this method honors timeouts. When the socket
    * read times out, the socket is asynchronously closed by a watchdog thread.
    */
-  public static Source source(final Socket socket) throws IOException {
+  public static Source source(Socket socket) throws IOException {
     if (socket == null) throw new IllegalArgumentException("socket == null");
     AsyncTimeout timeout = timeout(socket);
     Source source = source(socket.getInputStream(), timeout);
@@ -200,13 +226,38 @@ public final class Okio {
 
   private static AsyncTimeout timeout(final Socket socket) {
     return new AsyncTimeout() {
+      @Override protected IOException newTimeoutException(@Nullable IOException cause) {
+        InterruptedIOException ioe = new SocketTimeoutException("timeout");
+        if (cause != null) {
+          ioe.initCause(cause);
+        }
+        return ioe;
+      }
+
       @Override protected void timedOut() {
         try {
           socket.close();
         } catch (Exception e) {
           logger.log(Level.WARNING, "Failed to close timed out socket " + socket, e);
+        } catch (AssertionError e) {
+          if (isAndroidGetsocknameError(e)) {
+            // Catch this exception due to a Firmware issue up to android 4.2.2
+            // https://code.google.com/p/android/issues/detail?id=54072
+            logger.log(Level.WARNING, "Failed to close timed out socket " + socket, e);
+          } else {
+            throw e;
+          }
         }
       }
     };
+  }
+
+  /**
+   * Returns true if {@code e} is due to a firmware bug fixed after Android 4.2.2.
+   * https://code.google.com/p/android/issues/detail?id=54072
+   */
+  static boolean isAndroidGetsocknameError(AssertionError e) {
+    return e.getCause() != null && e.getMessage() != null
+        && e.getMessage().contains("getsockname failed");
   }
 }

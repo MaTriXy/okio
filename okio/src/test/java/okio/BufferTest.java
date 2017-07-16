@@ -25,6 +25,7 @@ import java.util.Random;
 import org.junit.Test;
 
 import static java.util.Arrays.asList;
+import static okio.TestUtil.bufferWithRandomSegmentLayout;
 import static okio.TestUtil.repeat;
 import static okio.Util.UTF_8;
 import static org.junit.Assert.assertEquals;
@@ -71,27 +72,19 @@ public final class BufferTest {
     assertEquals(Segment.SIZE * 3, buffer.completeSegmentByteCount());
   }
 
-  @Test public void toStringOnEmptyBuffer() throws Exception {
-    Buffer buffer = new Buffer();
-    assertEquals("Buffer[size=0]", buffer.toString());
-  }
-
-  @Test public void toStringOnSmallBufferIncludesContents() throws Exception {
-    Buffer buffer = new Buffer();
-    buffer.write(ByteString.decodeHex("a1b2c3d4e5f61a2b3c4d5e6f10203040"));
-    assertEquals("Buffer[size=16 data=a1b2c3d4e5f61a2b3c4d5e6f10203040]", buffer.toString());
-  }
-
-  @Test public void toStringOnLargeBufferIncludesMd5() throws Exception {
-    Buffer buffer = new Buffer();
-    buffer.write(ByteString.encodeUtf8("12345678901234567"));
-    assertEquals("Buffer[size=17 md5=2c9728a2138b2f25e9f89f99bdccf8db]", buffer.toString());
-  }
-
-  @Test public void toStringOnMultipleSegmentBuffer() throws Exception {
-    Buffer buffer = new Buffer();
-    buffer.writeUtf8(repeat('a', 6144));
-    assertEquals("Buffer[size=6144 md5=d890021f28522533c1cc1b9b1f83ce73]", buffer.toString());
+  /** Buffer's toString is the same as ByteString's. */
+  @Test public void bufferToString() throws Exception {
+    assertEquals("[size=0]", new Buffer().toString());
+    assertEquals("[text=a\\r\\nb\\nc\\rd\\\\e]",
+        new Buffer().writeUtf8("a\r\nb\nc\rd\\e").toString());
+    assertEquals("[text=Tyrannosaur]",
+        new Buffer().writeUtf8("Tyrannosaur").toString());
+    assertEquals("[text=təˈranəˌsôr]", new Buffer()
+        .write(ByteString.decodeHex("74c999cb8872616ec999cb8c73c3b472"))
+        .toString());
+    assertEquals("[hex=0000000000000000000000000000000000000000000000000000000000000000000000000000"
+        + "0000000000000000000000000000000000000000000000000000]",
+        new Buffer().write(new byte[64]).toString());
   }
 
   @Test public void multipleSegmentBuffers() throws Exception {
@@ -118,23 +111,23 @@ public final class BufferTest {
     // Take 2 * MAX_SIZE segments. This will drain the pool, even if other tests filled it.
     buffer.write(new byte[(int) SegmentPool.MAX_SIZE]);
     buffer.write(new byte[(int) SegmentPool.MAX_SIZE]);
-    assertEquals(0, SegmentPool.INSTANCE.byteCount);
+    assertEquals(0, SegmentPool.byteCount);
 
     // Recycle MAX_SIZE segments. They're all in the pool.
     buffer.readByteString(SegmentPool.MAX_SIZE);
-    assertEquals(SegmentPool.MAX_SIZE, SegmentPool.INSTANCE.byteCount);
+    assertEquals(SegmentPool.MAX_SIZE, SegmentPool.byteCount);
 
     // Recycle MAX_SIZE more segments. The pool is full so they get garbage collected.
     buffer.readByteString(SegmentPool.MAX_SIZE);
-    assertEquals(SegmentPool.MAX_SIZE, SegmentPool.INSTANCE.byteCount);
+    assertEquals(SegmentPool.MAX_SIZE, SegmentPool.byteCount);
 
     // Take MAX_SIZE segments to drain the pool.
     buffer.write(new byte[(int) SegmentPool.MAX_SIZE]);
-    assertEquals(0, SegmentPool.INSTANCE.byteCount);
+    assertEquals(0, SegmentPool.byteCount);
 
     // Take MAX_SIZE more segments. The pool is drained so these will need to be allocated.
     buffer.write(new byte[(int) SegmentPool.MAX_SIZE]);
-    assertEquals(0, SegmentPool.INSTANCE.byteCount);
+    assertEquals(0, SegmentPool.byteCount);
   }
 
   @Test public void moveBytesBetweenBuffersShareSegment() throws Exception {
@@ -569,28 +562,24 @@ public final class BufferTest {
     assertEquals(as + bs + as + bs, source.readUtf8());
   }
 
-  /**
-   * Returns a new buffer containing the data in {@code data}, and a segment
-   * layout determined by {@code dice}.
-   */
-  private Buffer bufferWithRandomSegmentLayout(Random dice, byte[] data) throws IOException {
-    Buffer result = new Buffer();
+  @Test public void copyToEmptySource() throws Exception {
+    Buffer source = new Buffer();
+    Buffer target = new Buffer().writeUtf8("aaa");
+    source.copyTo(target, 0L, 0L);
+    assertEquals("", source.readUtf8());
+    assertEquals("aaa", target.readUtf8());
+  }
 
-    // Writing to result directly will yield packed segments. Instead, write to
-    // other buffers, then write those buffers to result.
-    for (int pos = 0, byteCount; pos < data.length; pos += byteCount) {
-      byteCount = (Segment.SIZE / 2) + dice.nextInt(Segment.SIZE / 2);
-      if (byteCount > data.length - pos) byteCount = data.length - pos;
-      int offset = dice.nextInt(Segment.SIZE - byteCount);
+  @Test public void copyToEmptyTarget() throws Exception {
+    Buffer source = new Buffer().writeUtf8("aaa");
+    Buffer target = new Buffer();
+    source.copyTo(target, 0L, 3L);
+    assertEquals("aaa", source.readUtf8());
+    assertEquals("aaa", target.readUtf8());
+  }
 
-      Buffer segment = new Buffer();
-      segment.write(new byte[offset]);
-      segment.write(data, pos, byteCount);
-      segment.skip(offset);
-
-      result.write(segment, byteCount);
-    }
-
-    return result;
+  @Test public void snapshotReportsAccurateSize() throws Exception {
+    Buffer buf = new Buffer().write(new byte[] { 0, 1, 2, 3 });
+    assertEquals(1, buf.snapshot(1).size());
   }
 }
